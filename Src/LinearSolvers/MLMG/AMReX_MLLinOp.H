@@ -2,6 +2,10 @@
 #define AMREX_ML_LINOP_H_
 #include <AMReX_Config.H>
 
+// CNS patch (CambridgeNumericalSolutions/amrex, branch cns/<release>): MLLinOp keeps
+// the AMR ratio per level pair as an IntVect, so a level may refine some directions only.
+#define AMREX_CNS_MLLINOP_INTVECT_AMR_RATIO 1
+
 #if defined(AMREX_USE_HYPRE) && (AMREX_SPACEDIM > 1)
 #include <AMReX_Hypre.H>
 #include <AMReX_HypreNodeLap.H>
@@ -888,7 +892,10 @@ protected:
     bool enforceSingularSolvable = true;
 
     int m_num_amr_levels = 0;
+    //! Isotropic AMR ratio per level pair (active directions); -1 for a directional pair
     Vector<int> m_amr_ref_ratio;
+    //! AMR ratio per level pair and direction (1 in a hidden direction)
+    Vector<IntVect> m_amr_ref_ratio_vect;
 
     Vector<int> m_num_mg_levels;
     const MLLinOpT<MF>* m_parent = nullptr;
@@ -942,14 +949,16 @@ protected:
     //! Return AMR refinement ratios
     [[nodiscard]] const Vector<int>& AMRRefRatio () const noexcept { return m_amr_ref_ratio; }
 
-    //! Return AMR refinement ratio at given AMR level
-    [[nodiscard]] int AMRRefRatio (int amr_lev) const noexcept { return m_amr_ref_ratio[amr_lev]; }
+    //! Return AMR refinement ratio at given AMR level (isotropic level pairs only)
+    [[nodiscard]] int AMRRefRatio (int amr_lev) const {
+        AMREX_ALWAYS_ASSERT_WITH_MESSAGE(m_amr_ref_ratio[amr_lev] != -1,
+            "MLLinOp::AMRRefRatio: directional AMR ratio; use AMRRefRatioVect");
+        return m_amr_ref_ratio[amr_lev];
+    }
 
     //! Return AMR refinement ratio as IntVect (1 in hidden direction)
     [[nodiscard]] IntVect AMRRefRatioVect (int amr_lev) const noexcept {
-        IntVect rr(m_amr_ref_ratio[amr_lev]);
-        if (info.hasHiddenDimension()) { rr[info.hidden_direction] = 1; }
-        return rr;
+        return m_amr_ref_ratio_vect[amr_lev];
     }
 
     [[nodiscard]] FabFactory<FAB> const* Factory (int amr_lev, int mglev=0) const noexcept {
@@ -1148,6 +1157,7 @@ MLLinOpT<MF>::defineGrids (const Vector<Geometry>& a_geom,
     }
 
     m_amr_ref_ratio.resize(m_num_amr_levels);
+    m_amr_ref_ratio_vect.resize(m_num_amr_levels);
     m_num_mg_levels.resize(m_num_amr_levels);
 
     m_geom.clear();
@@ -1192,35 +1202,57 @@ MLLinOpT<MF>::defineGrids (const Vector<Geometry>& a_geom,
             m_factory[amrlev].push_back(std::make_unique<DefaultFabFactory<FAB>>());
         }
 
-        IntVect rr = mg_coarsen_ratio_v;
+        // The AMR ratio of this level pair, per direction, from the two domains.
         const Box& dom = a_geom[amrlev].Domain();
-        for (int i = 0; i < 2; ++i)
-        {
-            if (!dom.coarsenable(rr)) { amrex::Abort("MLLinOp: Uncoarsenable domain"); }
+        const Box& crse_dom = a_geom[amrlev-1].Domain();
+        const IntVect amr_rr = dom.length() / crse_dom.length();
+        if (!amr_rr.allGT(0) || amrex::refine(crse_dom, amr_rr) != dom) {
+            amrex::Abort("MLLinOp: fine domain is not a refinement of the coarse domain");
+        }
+        if (hasHiddenDimension() && amr_rr[info.hidden_direction] != 1) {
+            amrex::Abort("MLLinOp: the AMR ratio must be 1 in the hidden direction");
+        }
 
-            const Box& cdom = amrex::coarsen(dom,rr);
-            if (cdom == a_geom[amrlev-1].Domain()) { break; }
+        // MG levels between the two AMR levels. Each halves the directions
+        // whose remaining ratio is the largest, while that ratio exceeds 2.
+        // An isotropic ratio 4 gets one isotropic level, as before.
+        IntVect rr(1);
+        IntVect rem = amr_rr;
+        while (rem.max() > 2)
+        {
+            const int rmax = rem.max();
+            if (rmax % 2 != 0) { amrex::Abort("MLLinOp: AMR ratio is not a power of 2"); }
+            IntVect step(1);
+            for (int idim = 0; idim < AMREX_SPACEDIM; ++idim) {
+                if (rem[idim] == rmax) { step[idim] = 2; }
+            }
+            rr *= step;
+            rem /= step;
+            if (!dom.coarsenable(rr)) { amrex::Abort("MLLinOp: Uncoarsenable domain"); }
 
             ++(m_num_mg_levels[amrlev]);
 
-            m_geom[amrlev].emplace_back(cdom, rb, coord, is_per);
+            m_geom[amrlev].emplace_back(amrex::coarsen(dom,rr), rb, coord, is_per);
 
             m_grids[amrlev].push_back(a_grids[amrlev]);
             AMREX_ASSERT(m_grids[amrlev].back().coarsenable(rr));
             m_grids[amrlev].back().coarsen(rr);
 
             m_dmap[amrlev].push_back(a_dmap[amrlev]);
-
-            rr *= mg_coarsen_ratio_v;
         }
 
-#if (AMREX_SPACEDIM > 1)
-        if (hasHiddenDimension()) {
-            m_amr_ref_ratio[amrlev-1] = rr[(info.hidden_direction+1) % AMREX_SPACEDIM];
-        } else
-#endif
-        {
-            m_amr_ref_ratio[amrlev-1] = rr[0];
+        m_amr_ref_ratio_vect[amrlev-1] = amr_rr;
+        // The int ratio, as before, where the active directions agree.
+        const int ad = hasHiddenDimension() ? (info.hidden_direction+1) % AMREX_SPACEDIM : 0;
+        IntVect iso(amr_rr[ad]);
+        if (hasHiddenDimension()) { iso[info.hidden_direction] = 1; }
+        m_amr_ref_ratio[amrlev-1] = (amr_rr == iso) ? amr_rr[ad] : -1;
+        // The cell and nodal operators (MF = MultiFab) assume an isotropic ratio
+        // in their transfers; an operator with its own transfers may take any.
+        if constexpr (IsMultiFabLike_v<MF>) {
+            if (m_amr_ref_ratio[amrlev-1] == -1) {
+                amrex::Abort("MLLinOp: this operator does not support directional AMR ratios");
+            }
         }
     }
 
@@ -1453,7 +1485,7 @@ MLLinOpT<MF>::defineGrids (const Vector<Geometry>& a_geom,
     }
 
     for (int amrlev = 0; amrlev < m_num_amr_levels; ++amrlev) {
-        if (AMRRefRatio(amrlev) == 4 && mg_coarsen_ratio_vec.empty()) {
+        if (m_amr_ref_ratio[amrlev] == 4 && mg_coarsen_ratio_vec.empty()) {
             mg_coarsen_ratio_vec.push_back(IntVect(2));
         }
     }
