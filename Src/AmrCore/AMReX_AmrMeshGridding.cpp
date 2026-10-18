@@ -479,7 +479,18 @@ AmrMesh::MakeNewGridsExtended (int lbase, Real time, int& new_finest, Vector<Box
                     b.coarsen(ref_ratio[levc]);
                     b.coarsen(bf_lev[levc]);
 
-                    ba_tags.intersections(b, isects, false, tags.nGrowVect());
+                    // Look up only the part inside the domain in the tag boxes. A cell past a
+                    // periodic face that falls in a TagBox's ghost cells would stay there:
+                    // mapPeriodicRemoveDuplicates moves it to its image only into a TagBox that
+                    // holds the image, and with none the clusters drop it, so the new level does
+                    // not nest the finer one at the seam. The rest goes to tags_proj below, which
+                    // wraps periodic directions.
+                    Box const b_in = b & domain;
+                    if (b_in.ok()) {
+                        ba_tags.intersections(b_in, isects, false, tags.nGrowVect());
+                    } else {
+                        isects.clear();
+                    }
                     bl1.clear();
                     bl1.push_back(b);
                     for (auto const& kv : isects) {
